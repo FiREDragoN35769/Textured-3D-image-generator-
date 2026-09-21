@@ -1,0 +1,72 @@
+[
+  {
+    "content": "[P1-1] Install deps",
+    "id": "1",
+    "status": "completed"
+  },
+  {
+    "content": "[P1-2] Update project metadata",
+    "id": "2",
+    "status": "completed"
+  },
+  {
+    "content": "[P1-3] Build backend: routes.py",
+    "id": "3",
+    "status": "completed"
+  },
+  {
+    "content": "[P1-4] Build types.ts",
+    "id": "4",
+    "status": "completed"
+  },
+  {
+    "content": "[P1-5] Build Zustand store",
+    "id": "5",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-1] Build 3D viewer component",
+    "id": "6",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-2] Build 2D image viewer component",
+    "id": "7",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-3] Build Explorer-style toolbar",
+    "id": "8",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-4] Build AI assistant panel",
+    "id": "9",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-5] Build settings dialog",
+    "id": "10",
+    "status": "completed"
+  },
+  {
+    "content": "[P2-6] Build history panel and prompt/edit dialogs",
+    "id": "11",
+    "status": "completed"
+  },
+  {
+    "content": "[P3-1] Build main App.tsx layout",
+    "id": "12",
+    "status": "completed"
+  },
+  {
+    "content": "[P3-2] PWA: manifest.json + service worker",
+    "id": "13",
+    "status": "completed"
+  },
+  {
+    "content": "[P3-3] Run build, fix errors, start server, verify",
+    "id": "14",
+    "status": "completed"
+  }
+]

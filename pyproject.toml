@@ -1,7 +1,7 @@
 [project]
-name = "react-app"
-version = "0.1.0"
-description = "React App with FastAPI Backend"
+name = "textured-3d-image-generator"
+version = "1.0.0"
+description = "Textured 3D Image Generator — create images from text/reference, generate textured 3D geometry, preview in Three.js, export GLB"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,6 +10,12 @@ dependencies = [
     "httpx==0.28.1",
     "python-multipart==0.0.22",
     "watchfiles==1.1.1",
+    "google-genai>=2.22.0",
+    "pillow>=12.3.0",
+    "trimesh>=5.1.0",
+    "numpy>=2.5.3",
+    "sqlalchemy>=2.0.52",
+    "psycopg2-binary>=2.9.12",
 ]
 
 [tool.uv]

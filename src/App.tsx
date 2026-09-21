@@ -1,43 +1,98 @@
-import type { ApiStatus, HealthResponse } from "./types";
-import { Card, CardContent } from "@/components/ui/card";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
+import { useStore } from "@/lib/store";
+import { Toolbar } from "@/components/toolbar";
+import { Viewer2D } from "@/components/viewer-2d";
+import { Viewer3D } from "@/components/viewer-3d";
+import { PromptBar } from "@/components/prompt-bar";
+import { AssistantPanel } from "@/components/assistant-panel";
+import { SettingsDialog } from "@/components/settings-dialog";
+import { HistoryPanel } from "@/components/history-panel";
+import { ProjectsPanel } from "@/components/projects-panel";
+import { Toaster } from "sonner";
+import { cn } from "@/lib/utils";
+import type { HealthResponse } from "./types";
 
 function App() {
-  const [apiStatus, setApiStatus] = useState<ApiStatus>("checking");
+  const viewMode = useStore((s) => s.viewMode);
+  const assistantOpen = useStore((s) => s.assistantOpen);
+  const setApiStatus = useStore((s) => s.setApiStatus);
+  const setSettings = useStore((s) => s.setSettings);
+  const setMeshParams = useStore((s) => s.setMeshParams);
 
+  // Check API health on mount
   useEffect(() => {
     fetch("/api/health")
       .then((r) => r.json())
-      .then((data: HealthResponse) => setApiStatus(data?.ok ? "connected" : "error"))
-      .catch(() => setApiStatus("error"));
-  }, []);
+      .then((data: HealthResponse) => {
+        setApiStatus(data.ok, data.db ?? false, data.gemini ?? false);
+      })
+      .catch(() => setApiStatus(false, false, false));
+  }, [setApiStatus]);
 
-  const dotColor =
-    apiStatus === "connected" ? "#22c55e" : apiStatus === "error" ? "#ef4444" : "#ccc";
-  const textColor =
-    apiStatus === "connected" ? "#16a34a" : apiStatus === "error" ? "#dc2626" : undefined;
-  const statusText =
-    apiStatus === "checking"
-      ? "Checking API\u2026"
-      : apiStatus === "connected"
-        ? "API connected"
-        : "API unreachable";
+  // Load saved settings
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then((data) => {
+        setSettings(data);
+        setMeshParams({
+          subdivisions: data.subdivisions,
+          height_scale: data.height_scale,
+          smooth: data.smooth,
+        });
+      })
+      .catch(() => {});
+  }, [setSettings, setMeshParams]);
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background">
-      <Card>
-        <CardContent className="pt-6 text-center">
-          <h1 className="text-2xl font-bold text-foreground mb-2">Welcome to your React Web App</h1>
-          <p className="text-muted-foreground">Start building something amazing.</p>
-          <div className="mt-4 flex items-center justify-center gap-2 text-sm">
-            <span
-              className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ background: dotColor }}
-            />
-            <span style={{ color: textColor }}>{statusText}</span>
+    <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
+      {/* Toolbar */}
+      <Toolbar />
+
+      {/* Main content area */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Viewer area */}
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <div className="relative flex-1 overflow-hidden">
+            <div className={cn("absolute inset-0", viewMode === "2d" ? "block" : "hidden")}>
+              <Viewer2D />
+            </div>
+            <div className={cn("absolute inset-0", viewMode === "3d" ? "block" : "hidden")}>
+              <Viewer3D />
+            </div>
+
+            {/* View mode indicator */}
+            <div className="pointer-events-none absolute top-2 left-2 z-10">
+              <span className="rounded-md bg-background/80 px-2 py-1 text-xs font-medium text-muted-foreground backdrop-blur">
+                {viewMode === "2d" ? "2D View" : "3D View"}
+              </span>
+            </div>
+
+            {/* Zoom indicator */}
+            <div className="pointer-events-none absolute top-2 right-2 z-10">
+              <span className="rounded-md bg-background/80 px-2 py-1 text-xs font-mono text-muted-foreground backdrop-blur">
+                {Math.round(useStore((s) => s.zoom) * 100)}%
+              </span>
+            </div>
           </div>
-        </CardContent>
-      </Card>
+
+          {/* Prompt bar at bottom */}
+          <PromptBar />
+        </div>
+
+        {/* Assistant panel (right side) */}
+        {assistantOpen && (
+          <div className="w-full sm:w-80 shrink-0">
+            <AssistantPanel />
+          </div>
+        )}
+      </div>
+
+      {/* Dialogs and panels */}
+      <SettingsDialog />
+      <HistoryPanel />
+      <ProjectsPanel />
+      <Toaster position="bottom-center" theme="dark" />
     </div>
   );
 }
