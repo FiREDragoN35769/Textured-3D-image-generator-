@@ -34,6 +34,7 @@
 - Original heightmap fields remain accepted in old settings records for compatibility, but are not used for reconstruction.
 
 ## Boundaries
+- Current user requirement: a native offline image-to-mesh engine on the Note 20 Ultra itself. The desktop/web repair does not complete this goal. SOURCEFORGE-NOTES.md records inspected split ONNX graphs, mobile runtime candidates, and the remaining Android/device checks.
 - No new repository, APK, or live Workshop deployment was created by this repair.
 - Single-image geometry infers unseen surfaces; multiview input and character rigging remain outside this patch.
 - Live Gemini credentials/quota and the user's Windows/NVIDIA setup are not verified here.
