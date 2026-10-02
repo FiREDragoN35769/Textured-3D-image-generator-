@@ -75,3 +75,5 @@ A real offline CPU reconstruction and browser flow are recorded in `.workshop/ve
 The original repository has existing lint violations in untouched shadcn files; changed source files are checked separately.
 
 Upstream implementation: [TripoSR](https://github.com/VAST-AI-Research/TripoSR/tree/107cefdc244c39106fa830359024f6a2f1c78871).
+
+Additional component research: [SourceForge and Android candidates](SOURCEFORGE-NOTES.md).
