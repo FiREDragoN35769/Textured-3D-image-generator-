@@ -5,36 +5,39 @@ import base64
 import time
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
-import numpy as np
-from PIL import Image
-import trimesh
-import trimesh.visual
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from fastapi import FastAPI, APIRouter, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy import create_engine, inspect, text as sql_text
+
+from mesh_service import ReconstructionService, local_configuration
+from mesh_formats import export_model
 
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
-DB_URL = os.environ.get("DBD8870D13_DATABASE_URL", "")
+DATA_DIR = Path(os.environ.get("STUDIO_DATA_DIR", Path(__file__).resolve().parent / ".data")).resolve()
+DB_URL = os.environ.get("DBD8870D13_DATABASE_URL") or os.environ.get("DATABASE_URL") or f"sqlite:///{DATA_DIR / 'studio.sqlite'}"
 
+@lru_cache(maxsize=1)
 def get_engine():
-    if not DB_URL:
-        return None
-    return create_engine(DB_URL, pool_pre_ping=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    options = {"check_same_thread": False} if DB_URL.startswith("sqlite:") else {}
+    return create_engine(DB_URL, pool_pre_ping=True, connect_args=options)
 
 def init_db():
     engine = get_engine()
-    if not engine:
-        return
     with engine.begin() as conn:
         conn.execute(sql_text("""
             CREATE TABLE IF NOT EXISTS projects (
@@ -68,28 +71,75 @@ def init_db():
                 value_json TEXT NOT NULL
             )
         """))
+    if "glb_id" not in {column["name"] for column in inspect(engine).get_columns("projects")}:
+        with engine.begin() as conn:
+            conn.execute(sql_text("ALTER TABLE projects ADD COLUMN glb_id TEXT"))
+
 
 
 # ---------------------------------------------------------------------------
 # Gemini client
 # ---------------------------------------------------------------------------
 
-_gemini_client = None
-
 def get_gemini_client():
-    global _gemini_client
-    if _gemini_client is not None:
-        return _gemini_client
     api_key = os.environ.get("GEMINI_WORKSHOP_API_KEY")
     base_url = os.environ.get("GEMINI_WORKSHOP_BASE_URL")
     if not api_key or not base_url:
-        return None
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        base_url = os.environ.get("GEMINI_BASE_URL")
+        if not api_key:
+            return None
+    return configured_gemini_client(api_key, base_url)
+
+@lru_cache(maxsize=4)
+def configured_gemini_client(api_key: str, base_url: Optional[str]):
     from google import genai
-    _gemini_client = genai.Client(
-        api_key=api_key,
-        http_options={"api_version": "v1alpha", "base_url": base_url},
-    )
-    return _gemini_client
+    options = {"api_version": "v1alpha" if base_url else "v1beta", "timeout": 120_000}
+    if base_url:
+        options["base_url"] = base_url
+    return genai.Client(api_key=api_key, http_options=options)
+
+def provider_error(error: Exception) -> HTTPException:
+    # Never send provider exception text (which may contain credentials) to the browser.
+    status = getattr(error, "code", None)
+    if status in (401, 403):
+        return HTTPException(503, "The image provider rejected its credentials. Update the server's API key or Workshop connection.")
+    if status == 429:
+        return HTTPException(429, "The image provider's quota is exhausted. Your image and prompt are unchanged; retry after the quota resets or use a local backend.")
+    if status == 404:
+        return HTTPException(502, "The selected model is unavailable. Choose an image model supported by your provider.")
+    return HTTPException(502, "The generation provider failed or timed out. Your image and prompt are unchanged.")
+
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 25_000_000
+
+def normalize_image(raw: bytes) -> tuple[bytes, Image.Image]:
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(400, "File too large (max 20 MB).")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        if image.width * image.height > MAX_IMAGE_PIXELS:
+            raise HTTPException(400, "Image is too large (max 25 million pixels).")
+        image.load()
+        image = ImageOps.exif_transpose(image).convert("RGBA")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        if buffer.tell() > MAX_IMAGE_BYTES:
+            raise HTTPException(400, "Decoded image is too large (max 20 MB).")
+        return buffer.getvalue(), image
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        raise HTTPException(400, "Upload a valid PNG, JPEG, or WebP image.") from None
+
+def decode_image(data_url: str) -> tuple[bytes, Image.Image]:
+    if len(data_url) > MAX_IMAGE_BYTES * 4 // 3 + 256:
+        raise HTTPException(400, "Image too large (max 20 MB).")
+    try:
+        header, encoded = data_url.split(",", 1)
+        if header not in ("data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64"):
+            raise ValueError()
+        return normalize_image(base64.b64decode(encoded, validate=True))
+    except (ValueError, base64.binascii.Error):
+        raise HTTPException(400, "Provide a valid PNG, JPEG, or WebP data URL.") from None
 
 
 # ---------------------------------------------------------------------------
@@ -113,82 +163,6 @@ def check_safety(prompt: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# 3D mesh generation from image (heightmap / displacement)
-# ---------------------------------------------------------------------------
-
-def image_to_heightmap_mesh(
-    image: Image.Image,
-    subdivisions: int = 128,
-    height_scale: float = 0.3,
-    smooth: bool = True,
-) -> trimesh.Trimesh:
-    """Convert a 2D image into a textured 3D mesh using luminance as heightmap."""
-    # Convert to grayscale for height, keep original for texture
-    gray = image.convert("L").resize((subdivisions, subdivisions), Image.LANCZOS)
-    texture_img = image.convert("RGB").resize((subdivisions, subdivisions), Image.LANCZOS)
-
-    height_arr = np.array(gray, dtype=np.float32) / 255.0
-
-    if smooth:
-        # Simple box blur
-        kernel = np.ones((3, 3), dtype=np.float32) / 9.0
-        from numpy.lib.stride_tricks import sliding_window_view
-        padded = np.pad(height_arr, 1, mode="edge")
-        windows = sliding_window_view(padded, (3, 3))
-        height_arr = windows.mean(axis=(2, 3))
-
-    # Create a plane grid
-    xs = np.linspace(-1, 1, subdivisions)
-    ys = np.linspace(-1, 1, subdivisions)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-
-    # Displace Z by height
-    vertices = np.stack([
-        grid_x.flatten(),
-        grid_y.flatten(),
-        (height_arr.flatten() * height_scale),
-    ], axis=-1);
-
-    # Build faces (two triangles per quad)
-    row_count = subdivisions
-    faces = []
-    for i in range(row_count - 1):
-        for j in range(row_count - 1):
-            idx = i * row_count + j
-            faces.append([idx, idx + 1, idx + row_count])
-            faces.append([idx + 1, idx + row_count + 1, idx + row_count])
-    faces = np.array(faces, dtype=np.int64)
-
-    # UV coordinates
-    uvs = np.stack([
-        grid_x.flatten() * 0.5 + 0.5,
-        1.0 - (grid_y.flatten() * 0.5 + 0.5),
-    ], axis=-1)
-
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.visual = trimesh.visual.texture.TextureVisuals(
-        uv=uvs,
-        material=trimesh.visual.material.SimpleMaterial(
-            image=texture_img,
-        ),
-    )
-    return mesh
-
-
-def mesh_to_glb_bytes(mesh: trimesh.Trimesh) -> bytes:
-    """Export a trimesh as GLB binary data, with validation."""
-    export = mesh.export(file_type="glb")
-    if isinstance(export, str):
-        export = export.encode("utf-8")
-    # Validate by re-loading
-    try:
-        trimesh.load(io.BytesIO(export), file_type="glb", force="mesh")
-    except Exception as e:
-        raise ValueError(f"GLB validation failed: {e}")
-    return export
-
-
-# ---------------------------------------------------------------------------
 # API models
 # ---------------------------------------------------------------------------
 
@@ -196,8 +170,9 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     negative_prompt: str = ""
     model: str = "gemini-3.1-flash-image"
-    width: int = 1024
-    height: int = 1024
+    backend: Literal["gemini", "automatic1111", "local-stable-diffusion"] = "gemini"
+    width: int = Field(1024, ge=256, le=2048, multiple_of=64)
+    height: int = Field(1024, ge=256, le=2048, multiple_of=64)
     reference_image: Optional[str] = None  # data URL
 
 class GenerateResponse(BaseModel):
@@ -207,9 +182,10 @@ class GenerateResponse(BaseModel):
 
 class MeshRequest(BaseModel):
     image: str  # data URL
-    subdivisions: int = 128
-    height_scale: float = 0.3
-    smooth: bool = True
+    mesh_quality: Literal["draft", "balanced", "high"] = "balanced"
+    mesh_device: Literal["auto", "cpu", "cuda"] = "auto"
+    bake_texture: bool = False
+    texture_resolution: int = Field(1024, ge=256, le=2048, multiple_of=256)
 
 class MeshResponse(BaseModel):
     glb_available: bool
@@ -225,6 +201,7 @@ class ProjectSave(BaseModel):
     settings_json: str = "{}"
     image_data_url: Optional[str] = None
     mesh_params_json: Optional[str] = None
+    glb_id: Optional[str] = None
 
 class ProjectRecord(BaseModel):
     id: str
@@ -239,13 +216,17 @@ class ProjectRecord(BaseModel):
     updated_at: str
 
 class SettingsUpdate(BaseModel):
-    backend: str = "gemini"
+    backend: Literal["gemini", "automatic1111", "local-stable-diffusion"] = "gemini"
     model: str = "gemini-3.1-flash-image"
     subdivisions: int = 128
     height_scale: float = 0.3
     smooth: bool = True
     allow_adult_art: bool = True
     safety_mode: str = "standard"
+    mesh_quality: Literal["draft", "balanced", "high"] = "balanced"
+    mesh_device: Literal["auto", "cpu", "cuda"] = "auto"
+    bake_texture: bool = False
+    texture_resolution: int = Field(1024, ge=256, le=2048, multiple_of=256)
 
 class ChatRequest(BaseModel):
     message: str
@@ -260,102 +241,136 @@ class ChatResponse(BaseModel):
 # App factory
 # ---------------------------------------------------------------------------
 
-# In-memory GLB cache (per session)
-_glb_cache: dict[str, bytes] = {}
-
 def create_app(static_dir: str) -> FastAPI:
     api = APIRouter()
+    service = ReconstructionService(DATA_DIR)
 
-    # -- Health --
+    # -- Configuration status --
     @api.get("/health")
     def health():
-        return {"ok": True, "db": bool(DB_URL), "gemini": get_gemini_client() is not None}
+        with get_engine().connect() as conn:
+            conn.execute(sql_text("SELECT 1"))
+        config = local_configuration()
+        return {"ok": True, "db": True, "gemini": get_gemini_client() is not None,
+                "image_backends": {"gemini": get_gemini_client() is not None,
+                                   "automatic1111": bool(os.environ.get("SD_WEBUI_URL"))},
+                "mesh": {"ready": config["ready"], "method": "triposr", "missing": config["missing"]}}
 
     # -- Image generation --
     @api.post("/generate")
     async def generate(req: GenerateRequest):
-        client = get_gemini_client()
-        if client is None:
-            raise HTTPException(503, "Gemini API not configured. Set GEMINI_WORKSHOP_API_KEY and GEMINI_WORKSHOP_BASE_URL.")
-
         safe, reason = check_safety(req.prompt)
         if not safe:
             raise HTTPException(400, reason)
+        reference = decode_image(req.reference_image)[1] if req.reference_image else None
+        started = time.monotonic()
+        if req.backend in ("automatic1111", "local-stable-diffusion"):
+            import httpx
+            url = os.environ.get("SD_WEBUI_URL", "").rstrip("/")
+            if not url:
+                raise HTTPException(503, "Local image generation is not configured. Set SD_WEBUI_URL and start your Stable Diffusion server with --api.")
+            payload = {"prompt": req.prompt, "negative_prompt": req.negative_prompt,
+                       "width": req.width, "height": req.height, "steps": 20, "batch_size": 1}
+            operation = "txt2img"
+            if req.reference_image:
+                payload.update(init_images=[req.reference_image.split(",", 1)[1]], denoising_strength=0.45)
+                operation = "img2img"
+            if req.model and not req.model.startswith("gemini-"):
+                payload["override_settings"] = {"sd_model_checkpoint": req.model}
+                payload["override_settings_restore_afterwards"] = True
+            try:
+                async with httpx.AsyncClient(timeout=300) as http:
+                    response = await http.post(f"{url}/sdapi/v1/{operation}", json=payload)
+                    response.raise_for_status()
+                images = response.json().get("images") or []
+                if not images:
+                    raise ValueError("No image returned")
+                encoded = images[0].split(",", 1)[-1]
+                raw, _ = normalize_image(base64.b64decode(encoded, validate=True))
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(502, "Local image generation failed. Check that the Stable Diffusion API is running; your image and prompt are unchanged.") from None
+        else:
+            client = get_gemini_client()
+            if client is None:
+                raise HTTPException(503, "Gemini is not configured. Reconnect Gemini in Workshop, or set GEMINI_API_KEY on the server. You can still import an image and use the local 3D engine.")
+            from google.genai import types
+            prompt = req.prompt
+            if req.negative_prompt:
+                prompt += f"\nAvoid the following: {req.negative_prompt}"
+            contents = [reference, prompt] if reference else [prompt]
+            ratio = req.width / req.height
+            supported = [(1.0, "1:1"), (2/3, "2:3"), (3/2, "3:2"), (3/4, "3:4"), (4/3, "4:3"), (9/16, "9:16"), (16/9, "16:9")]
+            aspect = min(supported, key=lambda item: abs(item[0] - ratio))[1]
+            try:
+                response = await client.aio.models.generate_content(
+                    model=req.model, contents=contents,
+                    config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"],
+                                                       image_config=types.ImageConfig(aspect_ratio=aspect)),
+                )
+                raw = None
+                for part in response.parts or []:
+                    if part.inline_data is not None and (part.inline_data.mime_type or "").startswith("image/"):
+                        data = part.inline_data.data
+                        raw, _ = normalize_image(data if isinstance(data, bytes) else base64.b64decode(data, validate=True))
+                        break
+            except HTTPException:
+                raise
+            except Exception as error:
+                raise provider_error(error) from None
+            if raw is None:
+                raise HTTPException(502, "The provider returned no image. Its content rules or model limitations may apply; your original image and prompt are unchanged.")
+        data_url = "data:image/png;base64," + base64.b64encode(raw).decode()
+        return GenerateResponse(image=data_url, prompt=req.prompt, elapsed_ms=int((time.monotonic() - started) * 1000))
 
-        from google.genai import types
-
-        contents = []
-        if req.reference_image:
-            # Parse data URL
-            header, b64data = req.reference_image.split(",", 1)
-            img_bytes = base64.b64decode(b64data)
-            pil_img = Image.open(io.BytesIO(img_bytes))
-            contents.append(pil_img)
-
-        contents.append(req.prompt)
-
-        t0 = time.time()
-        try:
-            response = client.models.generate_content(
-                model=req.model,
-                contents=contents,
-                config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
-            )
-        except Exception as e:
-            raise HTTPException(502, f"Generation failed: {str(e)}")
-
-        for part in response.parts:
-            if part.inline_data is not None:
-                img_data = part.inline_data.data
-                mime = part.inline_data.mime_type or "image/png"
-                if isinstance(img_data, bytes):
-                    b64 = base64.b64encode(img_data).decode()
-                else:
-                    b64 = img_data
-                elapsed = int((time.time() - t0) * 1000)
-                data_url = f"data:{mime};base64,{b64}"
-                return GenerateResponse(image=data_url, prompt=req.prompt, elapsed_ms=elapsed)
-
-        raise HTTPException(500, "No image was returned by the model.")
-
-    # -- 3D mesh generation + GLB export --
-    @api.post("/mesh")
+    # -- Actual image-to-3D reconstruction jobs --
+    @api.post("/mesh", status_code=202)
     async def create_mesh(req: MeshRequest):
-        header, b64data = req.image.split(",", 1)
-        img_bytes = base64.b64decode(b64data)
-        pil_img = Image.open(io.BytesIO(img_bytes))
+        raw, _ = decode_image(req.image)
+        try:
+            return service.start(raw, req.model_dump(exclude={"image"}))
+        except RuntimeError as error:
+            raise HTTPException(503, str(error)) from None
 
-        t0 = time.time()
-        mesh = image_to_heightmap_mesh(
-            pil_img,
-            subdivisions=req.subdivisions,
-            height_scale=req.height_scale,
-            smooth=req.smooth,
-        )
-        glb_bytes = mesh_to_glb_bytes(mesh)
-        elapsed = int((time.time() - t0) * 1000)
+    @api.get("/mesh/{job_id}")
+    async def mesh_status(job_id: str):
+        try:
+            return service.get(job_id)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, "Reconstruction job not found.") from None
 
-        glb_id = str(uuid.uuid4())
-        _glb_cache[glb_id] = glb_bytes
+    @api.get("/mesh/{job_id}/image")
+    async def mesh_image(job_id: str):
+        try:
+            path = service.directory(job_id) / "input.png"
+            if not path.is_file():
+                raise FileNotFoundError()
+            return FileResponse(path, media_type="image/png")
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, "Source image not found.") from None
 
-        return MeshResponse(
-            glb_available=True,
-            vertices=len(mesh.vertices),
-            faces=len(mesh.faces),
-            elapsed_ms=elapsed,
-        ).model_dump() | {"glb_id": glb_id}
-
-    # -- Download GLB --
     @api.get("/glb/{glb_id}")
     async def download_glb(glb_id: str):
-        glb_bytes = _glb_cache.get(glb_id)
-        if glb_bytes is None:
-            raise HTTPException(404, "GLB not found. It may have expired — regenerate the mesh.")
-        return StreamingResponse(
-            io.BytesIO(glb_bytes),
-            media_type="model/gltf-binary",
-            headers={"Content-Disposition": "attachment; filename=textured_model.glb"},
-        )
+        try:
+            path = service.model_path(glb_id)
+            if not path.is_file():
+                raise FileNotFoundError()
+            return FileResponse(path, media_type="model/gltf-binary", filename="textured_model.glb")
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, "Model not found.") from None
+
+    @api.get("/export/{glb_id}/{file_format}")
+    async def export_mesh(glb_id: str, file_format: Literal["glb", "gltf", "stl", "obj"]):
+        try:
+            data = await asyncio.to_thread(service.model_path(glb_id).read_bytes)
+            result, mime, filename = await asyncio.to_thread(export_model, data, file_format)
+            return StreamingResponse(io.BytesIO(result), media_type=mime,
+                                     headers={"Content-Disposition": f"attachment; filename={filename}"})
+        except FileNotFoundError:
+            raise HTTPException(404, "Model not found.") from None
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
 
     # -- Project CRUD --
     @api.get("/projects")
@@ -365,13 +380,13 @@ def create_app(static_dir: str) -> FastAPI:
             return []
         with engine.connect() as conn:
             rows = conn.execute(sql_text(
-                "SELECT id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at FROM projects ORDER BY updated_at DESC"
+                "SELECT id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at, glb_id FROM projects ORDER BY updated_at DESC"
             )).fetchall()
         return [
             {
                 "id": r[0], "name": r[1], "prompt": r[2], "negative_prompt": r[3],
                 "settings_json": r[4], "image_data_url": r[5], "mesh_params_json": r[6],
-                "glb_available": bool(r[7]), "created_at": r[8], "updated_at": r[9],
+                "glb_available": bool(r[10] and service.model_path(r[10]).is_file()), "created_at": r[8], "updated_at": r[9], "glb_id": r[10],
             }
             for r in rows
         ]
@@ -381,6 +396,18 @@ def create_app(static_dir: str) -> FastAPI:
         engine = get_engine()
         if not engine:
             raise HTTPException(503, "Database not configured.")
+        try:
+            json.loads(req.settings_json)
+            if req.mesh_params_json:
+                json.loads(req.mesh_params_json)
+        except ValueError:
+            raise HTTPException(400, "Project settings must contain valid JSON.") from None
+        if req.glb_id:
+            try:
+                if not service.model_path(req.glb_id).is_file():
+                    raise ValueError()
+            except ValueError:
+                raise HTTPException(400, "The project's model does not exist.") from None
         now = datetime.now(timezone.utc).isoformat()
         pid = req.id or str(uuid.uuid4())
         with engine.begin() as conn:
@@ -388,18 +415,18 @@ def create_app(static_dir: str) -> FastAPI:
             if existing:
                 conn.execute(sql_text("""
                     UPDATE projects SET name=:name, prompt=:prompt, negative_prompt=:np,
-                    settings_json=:sj, image_data_url=:img, mesh_params_json=:mp, updated_at=:ts
+                    settings_json=:sj, image_data_url=:img, mesh_params_json=:mp, glb_id=:glb, glb_available=:available, updated_at=:ts
                     WHERE id=:id
                 """), {"name": req.name, "prompt": req.prompt, "np": req.negative_prompt,
                        "sj": req.settings_json, "img": req.image_data_url, "mp": req.mesh_params_json,
-                       "ts": now, "id": pid})
+                       "ts": now, "id": pid, "glb": req.glb_id, "available": int(bool(req.glb_id))})
             else:
                 conn.execute(sql_text("""
-                    INSERT INTO projects (id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at)
-                    VALUES (:id, :name, :prompt, :np, :sj, :img, :mp, 0, :ts, :ts)
+                    INSERT INTO projects (id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at, glb_id)
+                    VALUES (:id, :name, :prompt, :np, :sj, :img, :mp, :available, :ts, :ts, :glb)
                 """), {"id": pid, "name": req.name, "prompt": req.prompt, "np": req.negative_prompt,
                        "sj": req.settings_json, "img": req.image_data_url, "mp": req.mesh_params_json,
-                       "ts": now})
+                       "ts": now, "glb": req.glb_id, "available": int(bool(req.glb_id))})
         return {"id": pid, "saved": True}
 
     @api.get("/projects/{pid}")
@@ -409,14 +436,14 @@ def create_app(static_dir: str) -> FastAPI:
             raise HTTPException(503, "Database not configured.")
         with engine.connect() as conn:
             r = conn.execute(sql_text(
-                "SELECT id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at FROM projects WHERE id=:id"
+                "SELECT id, name, prompt, negative_prompt, settings_json, image_data_url, mesh_params_json, glb_available, created_at, updated_at, glb_id FROM projects WHERE id=:id"
             ), {"id": pid}).fetchone()
         if not r:
             raise HTTPException(404, "Project not found.")
         return {
             "id": r[0], "name": r[1], "prompt": r[2], "negative_prompt": r[3],
             "settings_json": r[4], "image_data_url": r[5], "mesh_params_json": r[6],
-            "glb_available": bool(r[7]), "created_at": r[8], "updated_at": r[9],
+            "glb_available": bool(r[10] and service.model_path(r[10]).is_file()), "created_at": r[8], "updated_at": r[9], "glb_id": r[10],
         }
 
     @api.delete("/projects/{pid}")
@@ -425,8 +452,8 @@ def create_app(static_dir: str) -> FastAPI:
         if not engine:
             raise HTTPException(503, "Database not configured.")
         with engine.begin() as conn:
-            conn.execute(sql_text("DELETE FROM projects WHERE id=:id"), {"id": pid})
             conn.execute(sql_text("DELETE FROM history WHERE project_id=:id"), {"id": pid})
+            conn.execute(sql_text("DELETE FROM projects WHERE id=:id"), {"id": pid})
         return {"deleted": True}
 
     # -- History --
@@ -462,6 +489,12 @@ def create_app(static_dir: str) -> FastAPI:
                    "img": img_val, "sj": settings_json, "ts": now})
         return {"id": hid, "saved": True}
 
+    @api.delete("/projects/{pid}/history/{hid}")
+    async def delete_history(pid: str, hid: str):
+        with get_engine().begin() as conn:
+            conn.execute(sql_text("DELETE FROM history WHERE id=:hid AND project_id=:pid"), {"hid": hid, "pid": pid})
+        return {"deleted": True}
+
     # -- Settings --
     @api.get("/settings")
     async def get_settings():
@@ -474,6 +507,10 @@ def create_app(static_dir: str) -> FastAPI:
             "smooth": True,
             "allow_adult_art": True,
             "safety_mode": "standard",
+            "mesh_quality": "balanced",
+            "mesh_device": "auto",
+            "bake_texture": False,
+            "texture_resolution": 1024,
         }
         if not engine:
             return defaults
@@ -516,13 +553,13 @@ def create_app(static_dir: str) -> FastAPI:
         full_msg = f"{system_prompt}\n\nUser context: {req.context}\n\nUser message: {req.message}"
         t0 = time.time()
         try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
+            response = await client.aio.models.generate_content(
+                model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash"),
                 contents=full_msg,
             )
             reply = response.text or "I couldn't generate a response."
         except Exception as e:
-            raise HTTPException(502, f"Chat failed: {str(e)}")
+            raise provider_error(e) from None
 
         elapsed = int((time.time() - t0) * 1000)
         return ChatResponse(reply=reply, elapsed_ms=elapsed)
@@ -530,27 +567,28 @@ def create_app(static_dir: str) -> FastAPI:
     # -- Upload reference image --
     @api.post("/upload")
     async def upload_image(file: UploadFile = File(...)):
-        raw = await file.read()
-        if len(raw) > 20 * 1024 * 1024:
-            raise HTTPException(400, "File too large (max 20 MB).")
-        img = Image.open(io.BytesIO(raw))
-        # Re-encode as PNG to normalize
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        return {"image": f"data:image/png;base64,{b64}", "size": [img.width, img.height]}
+        raw = await file.read(MAX_IMAGE_BYTES + 1)
+        raw, image = normalize_image(raw)
+        return {"image": "data:image/png;base64," + base64.b64encode(raw).decode(), "size": [image.width, image.height]}
 
     # -- Recovery: list unsaved/in-progress images from cache --
     @api.get("/recovery")
     async def recovery():
-        """Return count of GLB meshes available in cache."""
-        return {"glb_count": len(_glb_cache), "glb_ids": list(_glb_cache.keys())}
+        jobs = service.recover()
+        ids = [job["id"] for job in jobs if job["status"] == "completed" and service.model_path(job["id"]).is_file()]
+        return {"glb_count": len(ids), "glb_ids": ids, "jobs": jobs}
 
     # -----------------------------------------------------------------------
     # Build app
     # -----------------------------------------------------------------------
     init_db()
-    app = FastAPI(title="Textured 3D Image Generator")
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await service.close()
+
+    app = FastAPI(title="Textured 3D Image Generator", lifespan=lifespan)
+    app.state.reconstruction = service
     app.include_router(api, prefix="/api")
 
     if os.path.isdir(static_dir):
@@ -560,8 +598,13 @@ def create_app(static_dir: str) -> FastAPI:
 
         @app.get("/{path:path}")
         async def spa_fallback(request: Request, path: str):
-            file_path = os.path.join(static_dir, path)
-            if path and os.path.isfile(file_path):
+            if path.startswith("api/"):
+                raise HTTPException(404, "API route not found.")
+            root = Path(static_dir).resolve()
+            file_path = (root / path).resolve()
+            if not file_path.is_relative_to(root):
+                raise HTTPException(404, "File not found.")
+            if path and file_path.is_file():
                 return FileResponse(file_path)
             return FileResponse(
                 os.path.join(static_dir, "index.html"),

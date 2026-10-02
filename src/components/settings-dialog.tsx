@@ -1,203 +1,81 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useStore } from "@/lib/store";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
+import { requestJSON } from "@/lib/api";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { toast } from "sonner";
-import type { AppSettings } from "@/types";
+import type { AppSettings, HealthResponse, MeshParams } from "@/types";
+
+function SettingsForm({ settings }: { settings: AppSettings }) {
+  const [local, setLocal] = useState(settings);
+  const [saving, setSaving] = useState(false);
+  const close = () => useStore.getState().setSettingsOpen(false);
+  const save = async () => {
+    setSaving(true);
+    try {
+      await requestJSON("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(local) });
+      const store = useStore.getState();
+      store.setSettings(local);
+      store.setMeshParams(local);
+      const health = await requestJSON<HealthResponse>("/api/health");
+      store.setApiStatus(health.ok, !!health.db, !!health.gemini, health.image_backends, health.mesh?.ready);
+      toast.success("Settings saved");
+      close();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save settings");
+    } finally { setSaving(false); }
+  };
+  return <DialogContent className="max-w-lg">
+    <DialogHeader><DialogTitle>Settings</DialogTitle><DialogDescription>Choose your image generator and 3D reconstruction quality.</DialogDescription></DialogHeader>
+    <div className="space-y-5 max-h-[60vh] overflow-y-auto py-2">
+      <div className="space-y-3">
+        <Label>Image generator</Label>
+        <Select value={local.backend === "local-stable-diffusion" ? "automatic1111" : local.backend} onValueChange={(backend) => setLocal({ ...local, backend })}>
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent><SelectItem value="gemini">Gemini (Workshop or API key)</SelectItem><SelectItem value="automatic1111">Local Stable Diffusion</SelectItem></SelectContent>
+        </Select>
+        <Label htmlFor="image-model">Image model</Label>
+        <Input id="image-model" value={local.model} onChange={(event) => setLocal({ ...local, model: event.target.value })} />
+        <p className="text-xs text-muted-foreground">Local generation uses your installed checkpoint; importing images does not require Gemini.</p>
+      </div>
+      <Separator />
+      <div className="space-y-3">
+        <Label>3D reconstruction</Label>
+        <p className="text-xs text-muted-foreground">TripoSR reconstructs a complete object from one image. The local engine must be installed before generation.</p>
+        <Label>Quality</Label>
+        <Select value={local.mesh_quality} onValueChange={(value) => setLocal({ ...local, mesh_quality: value as MeshParams["mesh_quality"] })}>
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent><SelectItem value="draft">Draft (lowest memory)</SelectItem><SelectItem value="balanced">Balanced</SelectItem><SelectItem value="high">High detail</SelectItem></SelectContent>
+        </Select>
+        <Label>Compute device</Label>
+        <Select value={local.mesh_device} onValueChange={(value) => setLocal({ ...local, mesh_device: value as MeshParams["mesh_device"] })}>
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent><SelectItem value="auto">Auto</SelectItem><SelectItem value="cpu">CPU (slower)</SelectItem><SelectItem value="cuda">NVIDIA GPU</SelectItem></SelectContent>
+        </Select>
+        <div className="flex items-center justify-between"><Label>Bake texture atlas</Label><Switch checked={local.bake_texture} onCheckedChange={(bake_texture) => setLocal({ ...local, bake_texture })} /></div>
+        <p className="text-xs text-muted-foreground">Off uses the reconstructed vertex colors; on embeds a UV texture for compatible editors.</p>
+        {local.bake_texture && <Select value={String(local.texture_resolution)} onValueChange={(value) => setLocal({ ...local, texture_resolution: Number(value) })}>
+          <SelectTrigger aria-label="Texture resolution"><SelectValue /></SelectTrigger>
+          <SelectContent><SelectItem value="512">512 px</SelectItem><SelectItem value="1024">1024 px</SelectItem><SelectItem value="2048">2048 px</SelectItem></SelectContent>
+        </Select>}
+      </div>
+      <Separator />
+      <div className="space-y-2">
+        <div className="flex items-center justify-between"><Label>Allow adult artistic content</Label><Switch checked={local.allow_adult_art} onCheckedChange={(allow_adult_art) => setLocal({ ...local, allow_adult_art })} /></div>
+        <p className="text-xs text-muted-foreground">The selected image provider applies its own content rules.</p>
+      </div>
+    </div>
+    <DialogFooter><Button variant="outline" onClick={close} disabled={saving}>Cancel</Button><Button onClick={save} disabled={saving}>{saving ? "Saving…" : "Save Settings"}</Button></DialogFooter>
+  </DialogContent>;
+}
 
 export function SettingsDialog() {
-  const settingsOpen = useStore((s) => s.settingsOpen);
-  const setSettingsOpen = useStore((s) => s.setSettingsOpen);
-  const settings = useStore((s) => s.settings);
-  const setSettings = useStore((s) => s.setSettings);
-  const setMeshParams = useStore((s) => s.setMeshParams);
-
-  const [local, setLocal] = useState<AppSettings>(settings);
-
-  useEffect(() => {
-    if (settingsOpen) setLocal(settings);
-  }, [settingsOpen, settings]);
-
-  const handleSave = async () => {
-    setSettings(local);
-    setMeshParams({
-      subdivisions: local.subdivisions,
-      height_scale: local.height_scale,
-      smooth: local.smooth,
-    });
-    try {
-      await fetch("/api/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(local),
-      });
-      toast.success("Settings saved");
-    } catch {
-      toast.error("Failed to save settings to server");
-    }
-    setSettingsOpen(false);
-  };
-
-  return (
-    <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Settings</DialogTitle>
-          <DialogDescription>
-            Configure generation backend, mesh parameters, and safety options.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-5 max-h-[60vh] overflow-y-auto py-2">
-          {/* Backend */}
-          <div className="space-y-3">
-            <Label className="text-sm font-semibold">Generation Backend</Label>
-            <Select value={local.backend} onValueChange={(v) => setLocal({ ...local, backend: v })}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="gemini">Gemini (Workshop managed)</SelectItem>
-                <SelectItem value="local-stable-diffusion">Local Stable Diffusion (self-hosted)</SelectItem>
-                <SelectItem value="comfyui">ComfyUI (self-hosted)</SelectItem>
-                <SelectItem value="automatic1111">Automatic1111 (self-hosted)</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              Gemini is pre-configured. For local backends, run the server and configure its URL in your environment.
-              No paid APIs or per-generation credits — all backends are open-source or self-hosted.
-            </p>
-          </div>
-
-          <Separator />
-
-          {/* Model */}
-          <div className="space-y-3">
-            <Label className="text-sm font-semibold">Image Model</Label>
-            <Select value={local.model} onValueChange={(v) => setLocal({ ...local, model: v })}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="gemini-3.1-flash-image">Gemini Flash Image (fast, default)</SelectItem>
-                <SelectItem value="gemini-3.1-flash-lite-image">Gemini Flash Lite Image (cheapest)</SelectItem>
-                <SelectItem value="gemini-3-pro-image">Gemini Pro Image (highest quality)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          <Separator />
-
-          {/* 3D Mesh */}
-          <div className="space-y-4">
-            <Label className="text-sm font-semibold">3D Mesh Parameters</Label>
-
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label className="text-xs text-muted-foreground">Subdivisions</Label>
-                <span className="text-xs font-mono text-muted-foreground">{local.subdivisions}</span>
-              </div>
-              <Slider
-                value={[local.subdivisions]}
-                onValueChange={([v]) => setLocal({ ...local, subdivisions: v })}
-                min={32}
-                max={256}
-                step={16}
-              />
-              <p className="text-xs text-muted-foreground">Higher = more geometric detail. 128 is balanced.</p>
-            </div>
-
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label className="text-xs text-muted-foreground">Height Scale</Label>
-                <span className="text-xs font-mono text-muted-foreground">{local.height_scale.toFixed(2)}</span>
-              </div>
-              <Slider
-                value={[local.height_scale]}
-                onValueChange={([v]) => setLocal({ ...local, height_scale: v })}
-                min={0}
-                max={1}
-                step={0.05}
-              />
-              <p className="text-xs text-muted-foreground">How much depth to displace from luminance.</p>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label className="text-xs">Smooth heightmap</Label>
-              <Switch
-                checked={local.smooth}
-                onCheckedChange={(v) => setLocal({ ...local, smooth: v })}
-              />
-            </div>
-          </div>
-
-          <Separator />
-
-          {/* Safety */}
-          <div className="space-y-3">
-            <Label className="text-sm font-semibold">Safety & Content Policy</Label>
-
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <Label className="text-xs">Allow adult artistic content</Label>
-                <p className="text-xs text-muted-foreground">
-                  Permits lawful adult artistic nudity involving clearly adult fictional or consenting subjects.
-                </p>
-              </div>
-              <Switch
-                checked={local.allow_adult_art}
-                onCheckedChange={(v) => setLocal({ ...local, allow_adult_art: v })}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label className="text-xs text-muted-foreground">Safety Mode</Label>
-              <Select value={local.safety_mode} onValueChange={(v) => setLocal({ ...local, safety_mode: v })}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="standard">Standard (block minors, deepfakes, nonconsensual)</SelectItem>
-                  <SelectItem value="strict">Strict (additional content filtering)</SelectItem>
-                  <SelectItem value="permissive">Permissive (adult art allowed, core blocks enforced)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground">
-              <p className="font-medium text-destructive mb-1">Always blocked:</p>
-              <ul className="list-disc list-inside space-y-0.5">
-                <li>Minors and age-ambiguous subjects</li>
-                <li>Nonconsensual imagery</li>
-                <li>Explicit real-person deepfakes</li>
-              </ul>
-            </div>
-          </div>
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setSettingsOpen(false)}>Cancel</Button>
-          <Button onClick={handleSave}>Save Settings</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
+  const open = useStore((store) => store.settingsOpen);
+  const settings = useStore((store) => store.settings);
+  return <Dialog open={open} onOpenChange={useStore.getState().setSettingsOpen}>{open && <SettingsForm settings={settings} />}</Dialog>;
 }

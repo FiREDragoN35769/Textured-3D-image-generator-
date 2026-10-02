@@ -1,0 +1,13 @@
+# Separate environment: the app's newer numpy/trimesh must not affect TripoSR.
+numpy==1.26.4
+Pillow==10.1.0
+omegaconf==2.3.0
+einops==0.7.0
+transformers==4.35.0
+huggingface-hub==0.17.3
+trimesh==4.0.5
+rembg==2.0.60
+onnxruntime==1.20.1
+xatlas==0.0.9
+imageio[ffmpeg]==2.38.0
+scikit-image==0.26.0

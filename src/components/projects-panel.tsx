@@ -6,6 +6,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { FolderOpen, Trash2, Clock } from "lucide-react";
 import type { ProjectRecord } from "@/types";
 import { toast } from "sonner";
+import { requestJSON } from "@/lib/api";
 
 export function ProjectsPanel() {
   const projectsOpen = useStore((s) => s.projectsOpen);
@@ -21,16 +22,10 @@ export function ProjectsPanel() {
   const setMeshInfo = useStore((s) => s.setMeshInfo);
   const setViewMode = useStore((s) => s.setViewMode);
 
-  const loadProjects = () => {
-    fetch("/api/projects")
-      .then((r) => r.json())
-      .then((data: ProjectRecord[]) => setProjects(data))
-      .catch(() => {});
-  };
-
   useEffect(() => {
-    if (projectsOpen) loadProjects();
-  }, [projectsOpen]);
+    if (projectsOpen) requestJSON<ProjectRecord[]>("/api/projects").then(setProjects)
+      .catch((error) => toast.error(error.message));
+  }, [projectsOpen, setProjects]);
 
   const handleOpen = async (project: ProjectRecord) => {
     setProjectId(project.id);
@@ -38,9 +33,11 @@ export function ProjectsPanel() {
     setPrompt(project.prompt || "");
     setNegativePrompt(project.negative_prompt || "");
     setImage(project.image_data_url);
-    setGlbId(null);
+    setGlbId(project.glb_available ? project.glb_id ?? null : null);
+    if (project.glb_id) localStorage.setItem("studio-last-mesh-job", project.glb_id);
+    else localStorage.removeItem("studio-last-mesh-job");
     setMeshInfo(null);
-    setViewMode("2d");
+    setViewMode(project.glb_available ? "3d" : "2d");
 
     // Load mesh params if available
     if (project.mesh_params_json) {
@@ -56,7 +53,7 @@ export function ProjectsPanel() {
 
   const handleDelete = async (id: string) => {
     try {
-      await fetch(`/api/projects/${id}`, { method: "DELETE" });
+      await requestJSON(`/api/projects/${id}`, { method: "DELETE" });
       setProjects(projects.filter((p) => p.id !== id));
       toast.success("Project deleted");
     } catch {

@@ -1,4 +1,9 @@
 import { useStore } from "@/lib/store";
+import { generateImage, buildMesh, exportMesh } from "@/lib/actions";
+import { jsonPost, requestJSON } from "@/lib/api";
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import { useState } from "react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -46,7 +51,7 @@ function ToolButton({ icon, label, onClick, disabled, active }: ToolButtonProps)
           disabled={disabled}
         >
           {icon}
-          <span className="hidden sm:inline">{label}</span>
+          <span>{label}</span>
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">
@@ -59,118 +64,22 @@ function ToolButton({ icon, label, onClick, disabled, active }: ToolButtonProps)
 export function Toolbar() {
   const store = useStore();
 
-  const handleGenerate = async () => {
-    if (!store.prompt.trim()) {
-      store.setGenerateError("Enter a prompt first.");
-      return;
-    }
-    store.pushUndo();
-    store.setGenerating(true);
-    store.setGenerateError(null);
-    store.setGenerateProgress(10);
-
-    try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: store.prompt,
-          negative_prompt: store.negativePrompt,
-          model: store.settings.model,
-          reference_image: store.image,
-        }),
-      });
-      store.setGenerateProgress(70);
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Unknown error" }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      store.setImage(data.image);
-      store.setLastElapsed(data.elapsed_ms);
-      store.setGlbId(null);
-      store.setMeshInfo(null);
-      store.setGenerateProgress(100);
-
-      // Save to history
-      if (store.projectId) {
-        const fd = new FormData();
-        fd.set("action", "generate");
-        fd.set("prompt", store.prompt);
-        fd.set("image_data_url", data.image);
-        fd.set("settings_json", JSON.stringify(store.settings));
-        fetch(`/api/projects/${store.projectId}/history`, { method: "POST", body: fd }).catch(() => {});
-      }
-    } catch (e) {
-      store.setGenerateError(e instanceof Error ? e.message : "Generation failed");
-    } finally {
-      store.setGenerating(false);
-      store.setGenerateProgress(0);
-    }
-  };
-
-  const handleMesh = async () => {
-    if (!store.image) return;
-    store.pushUndo();
-    store.setMeshGenerating(true);
-    store.setMeshError(null);
-
-    try {
-      const res = await fetch("/api/mesh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image: store.image,
-          subdivisions: store.meshParams.subdivisions,
-          height_scale: store.meshParams.height_scale,
-          smooth: store.meshParams.smooth,
-        }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Unknown error" }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      store.setGlbId(data.glb_id);
-      store.setMeshInfo({ vertices: data.vertices, faces: data.faces, elapsed_ms: data.elapsed_ms });
-      store.setViewMode("3d");
-    } catch (e) {
-      store.setMeshError(e instanceof Error ? e.message : "Mesh generation failed");
-    } finally {
-      store.setMeshGenerating(false);
-    }
-  };
-
-  const handleExportGlb = () => {
-    if (!store.glbId) return;
-    window.open(`/api/glb/${store.glbId}`, "_blank");
-  };
+  const busy = store.isGenerating || store.isMeshGenerating;
+  const [format, setFormat] = useState<"glb" | "gltf" | "stl" | "obj">("glb");
+  const handleGenerate = () => generateImage();
+  const handleMesh = () => store.glbId ? store.setViewMode("3d") : buildMesh();
 
   const handleSave = async () => {
     try {
-      const res = await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: store.projectId,
-          name: store.projectName,
-          prompt: store.prompt,
-          negative_prompt: store.negativePrompt,
-          settings_json: JSON.stringify(store.settings),
-          image_data_url: store.image,
-          mesh_params_json: JSON.stringify(store.meshParams),
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        store.setProjectId(data.id);
-      }
-    } catch {
-      // ignore
+      const data = await requestJSON<{ id: string }>("/api/projects", jsonPost({
+        id: store.projectId, name: store.projectName, prompt: store.prompt,
+        negative_prompt: store.negativePrompt, settings_json: JSON.stringify(store.settings),
+        image_data_url: store.image, mesh_params_json: JSON.stringify(store.meshParams), glb_id: store.glbId,
+      }));
+      store.setProjectId(data.id);
+      toast.success("Project saved");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save the project");
     }
   };
 
@@ -189,15 +98,12 @@ export function Toolbar() {
       const fd = new FormData();
       fd.set("file", file);
       try {
-        const res = await fetch("/api/upload", { method: "POST", body: fd });
-        if (res.ok) {
-          const data = await res.json();
-          store.setImage(data.image);
-          store.setGlbId(null);
-          store.setMeshInfo(null);
-        }
-      } catch {
-        // ignore
+        const data = await requestJSON<{image: string}>("/api/upload", { method: "POST", body: fd });
+        store.setImage(data.image);
+        store.setViewMode("2d");
+        localStorage.removeItem("studio-last-mesh-job");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Could not import the image");
       }
     };
     input.click();
@@ -206,30 +112,25 @@ export function Toolbar() {
   const handleZoomIn = () => store.setZoom(Math.min(store.zoom + 0.25, 4));
   const handleZoomOut = () => store.setZoom(Math.max(store.zoom - 0.25, 0.25));
 
-  const handleEnhance = async () => {
-    if (!store.image) return;
-    store.pushUndo();
-    store.setPrompt(store.prompt + ", highly detailed, enhanced, sharp focus, professional quality");
-    await handleGenerate();
-  };
+  const handleEnhance = () => generateImage(true);
 
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex items-center gap-0.5 overflow-x-auto border-b border-border bg-card px-2 py-1.5">
-        <ToolButton icon={<FilePlus className="h-4 w-4" />} label="New" onClick={() => store.newProject()} />
-        <ToolButton icon={<FolderOpen className="h-4 w-4" />} label="Open" onClick={handleOpen} />
-        <ToolButton icon={<Upload className="h-4 w-4" />} label="Import" onClick={handleImport} />
-        <ToolButton icon={<Save className="h-4 w-4" />} label="Save" onClick={handleSave} disabled={!store.image && !store.prompt} />
+        <ToolButton icon={<FilePlus className="h-4 w-4" />} label="New" onClick={() => store.newProject()} disabled={busy} />
+        <ToolButton icon={<FolderOpen className="h-4 w-4" />} label="Open" onClick={handleOpen} disabled={busy} />
+        <ToolButton icon={<Upload className="h-4 w-4" />} label="Import" onClick={handleImport} disabled={busy} />
+        <ToolButton icon={<Save className="h-4 w-4" />} label="Save" onClick={handleSave} disabled={busy || (!store.image && !store.prompt)} />
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 
-        <ToolButton icon={<Undo2 className="h-4 w-4" />} label="Undo" onClick={() => store.undo()} disabled={!store.canUndo()} />
-        <ToolButton icon={<Redo2 className="h-4 w-4" />} label="Redo" onClick={() => store.redo()} disabled={!store.canRedo()} />
+        <ToolButton icon={<Undo2 className="h-4 w-4" />} label="Undo" onClick={() => store.undo()} disabled={busy || !store.canUndo()} />
+        <ToolButton icon={<Redo2 className="h-4 w-4" />} label="Redo" onClick={() => store.redo()} disabled={busy || !store.canRedo()} />
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 
         <ToolButton icon={<ImageIcon className="h-4 w-4" />} label="2D" onClick={() => store.setViewMode("2d")} active={store.viewMode === "2d"} />
-        <ToolButton icon={<Box className="h-4 w-4" />} label="3D" onClick={handleMesh} active={store.viewMode === "3d"} disabled={!store.image} />
+        <ToolButton icon={<Box className="h-4 w-4" />} label="3D" onClick={handleMesh} active={store.viewMode === "3d"} disabled={busy || !store.image} />
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 
@@ -237,11 +138,12 @@ export function Toolbar() {
           icon={<Wand2 className="h-4 w-4" />}
           label="Generate"
           onClick={handleGenerate}
-          disabled={store.isGenerating || !store.prompt.trim()}
+          disabled={busy || !store.prompt.trim()}
         />
-        <ToolButton icon={<Pencil className="h-4 w-4" />} label="Edit" onClick={() => store.setViewMode("2d")} disabled={!store.image} />
-        <ToolButton icon={<RefreshCw className="h-4 w-4" />} label="Regenerate" onClick={handleGenerate} disabled={store.isGenerating || !store.prompt.trim()} />
-        <ToolButton icon={<Wand2 className="h-4 w-4" />} label="Enhance" onClick={handleEnhance} disabled={!store.image} />
+        <ToolButton icon={<Pencil className="h-4 w-4" />} label="Edit" onClick={() => store.setViewMode("2d")} disabled={busy || !store.image} />
+        {store.glbId && <ToolButton icon={<Box className="h-4 w-4" />} label="Rebuild 3D" onClick={buildMesh} disabled={busy || !store.image} />}
+        <ToolButton icon={<RefreshCw className="h-4 w-4" />} label="Regenerate" onClick={handleGenerate} disabled={busy || !store.prompt.trim()} />
+        <ToolButton icon={<Wand2 className="h-4 w-4" />} label="Enhance" onClick={handleEnhance} disabled={busy || !store.image} />
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 
@@ -251,7 +153,16 @@ export function Toolbar() {
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 
-        <ToolButton icon={<Download className="h-4 w-4" />} label="Export GLB" onClick={handleExportGlb} disabled={!store.glbId} />
+        <Select value={format} onValueChange={(value) => setFormat(value as typeof format)}>
+          <SelectTrigger className="w-24 h-8" aria-label="Export format"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="glb">GLB</SelectItem>
+            <SelectItem value="gltf">glTF ZIP</SelectItem>
+            <SelectItem value="stl">STL</SelectItem>
+            <SelectItem value="obj">OBJ ZIP</SelectItem>
+          </SelectContent>
+        </Select>
+        <ToolButton icon={<Download className="h-4 w-4" />} label="Export" onClick={() => exportMesh(format)} disabled={busy || !store.glbId} />
 
         <Separator orientation="vertical" className="mx-1 h-7" />
 

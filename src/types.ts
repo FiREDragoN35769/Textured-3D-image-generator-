@@ -8,6 +8,8 @@ export interface HealthResponse {
   ok: boolean;
   db?: boolean;
   gemini?: boolean;
+  image_backends?: Record<string, boolean>;
+  mesh?: { ready: boolean; method: string; missing: string[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -21,6 +23,7 @@ export interface GenerateRequest {
   width?: number;
   height?: number;
   reference_image?: string | null;
+  backend?: string;
 }
 
 export interface GenerateResponse {
@@ -34,9 +37,10 @@ export interface GenerateResponse {
 // ---------------------------------------------------------------------------
 
 export interface MeshParams {
-  subdivisions: number;
-  height_scale: number;
-  smooth: boolean;
+  mesh_quality: "draft" | "balanced" | "high";
+  mesh_device: "auto" | "cpu" | "cuda";
+  bake_texture: boolean;
+  texture_resolution: number;
 }
 
 export interface MeshResponse {
@@ -45,6 +49,19 @@ export interface MeshResponse {
   faces: number;
   elapsed_ms: number;
   glb_id: string;
+  watertight: boolean;
+  method: string;
+  warnings: string[];
+}
+
+export interface MeshJob {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  stage: string;
+  progress: number;
+  error: string | null;
+  result: MeshResponse | null;
+  image_url: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +77,7 @@ export interface ProjectRecord {
   image_data_url: string | null;
   mesh_params_json: string | null;
   glb_available: boolean;
+  glb_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -72,6 +90,7 @@ export interface ProjectSave {
   settings_json: string;
   image_data_url?: string | null;
   mesh_params_json?: string | null;
+  glb_id?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +111,7 @@ export interface HistoryEntry {
 // Settings
 // ---------------------------------------------------------------------------
 
-export interface AppSettings {
+export interface AppSettings extends MeshParams {
   backend: string;
   model: string;
   subdivisions: number;

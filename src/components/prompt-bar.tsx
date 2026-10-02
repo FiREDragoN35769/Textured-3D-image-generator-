@@ -4,7 +4,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Wand2, Loader2, Settings2 } from "lucide-react";
 import { useState } from "react";
-import { toast } from "sonner";
+import { generateImage } from "@/lib/actions";
 
 export function PromptBar() {
   const prompt = useStore((s) => s.prompt);
@@ -12,83 +12,32 @@ export function PromptBar() {
   const negativePrompt = useStore((s) => s.negativePrompt);
   const setNegativePrompt = useStore((s) => s.setNegativePrompt);
   const isGenerating = useStore((s) => s.isGenerating);
-  const generateProgress = useStore((s) => s.generateProgress);
+  const isMeshGenerating = useStore((s) => s.isMeshGenerating);
+  const meshError = useStore((s) => s.meshError);
+  const meshStage = useStore((s) => s.meshStage);
+  const meshProgress = useStore((s) => s.meshProgress);
   const generateError = useStore((s) => s.generateError);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const meshInfo = useStore((s) => s.meshInfo);
-  const geminiConnected = useStore((s) => s.geminiConnected);
+  const backend = useStore((s) => s.settings.backend);
+  const backends = useStore((s) => s.imageBackends);
 
   const [showNegative, setShowNegative] = useState(false);
 
-  const handleGenerate = async () => {
-    if (!prompt.trim()) {
-      toast.error("Enter a prompt first");
-      return;
-    }
-    if (!geminiConnected) {
-      toast.error("Gemini API not connected. Check your configuration.");
-      return;
-    }
-
-    const store = useStore.getState();
-    store.pushUndo();
-    store.setGenerating(true);
-    store.setGenerateError(null);
-    store.setGenerateProgress(10);
-
-    try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          negative_prompt: negativePrompt,
-          model: store.settings.model,
-          reference_image: store.image,
-        }),
-      });
-      store.setGenerateProgress(70);
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Unknown error" }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      store.setImage(data.image);
-      store.setLastElapsed(data.elapsed_ms);
-      store.setGlbId(null);
-      store.setMeshInfo(null);
-      store.setGenerateProgress(100);
-
-      if (store.projectId) {
-        const fd = new FormData();
-        fd.set("action", "generate");
-        fd.set("prompt", prompt);
-        fd.set("image_data_url", data.image);
-        fd.set("settings_json", JSON.stringify(store.settings));
-        fetch(`/api/projects/${store.projectId}/history`, { method: "POST", body: fd }).catch(() => {});
-      }
-    } catch (e) {
-      store.setGenerateError(e instanceof Error ? e.message : "Generation failed");
-      toast.error(e instanceof Error ? e.message : "Generation failed");
-    } finally {
-      store.setGenerating(false);
-      store.setGenerateProgress(0);
-    }
-  };
+  const handleGenerate = () => generateImage();
 
   return (
     <div className="border-t border-border bg-card p-3 space-y-3">
-      {/* Progress bar */}
-      {isGenerating && generateProgress > 0 && (
-        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full bg-primary transition-all duration-300"
-            style={{ width: `${generateProgress}%` }}
-          />
+      {isGenerating && <p className="text-xs text-muted-foreground">Generating image…</p>}
+      {isMeshGenerating && (
+        <div role="status" className="space-y-1">
+          <p className="text-xs text-muted-foreground">{meshStage}</p>
+          <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+            <div className="h-full bg-primary transition-all" style={{ width: `${Math.max(3, meshProgress)}%` }} />
+          </div>
         </div>
       )}
+      {meshError && <p role="alert" className="text-xs text-destructive">{meshError}</p>}
 
       {/* Error */}
       {generateError && (
@@ -112,6 +61,7 @@ export function PromptBar() {
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Describe the image you want to generate…"
             className="min-h-[60px] resize-none"
+            disabled={isGenerating || isMeshGenerating}
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                 e.preventDefault();
@@ -131,7 +81,7 @@ export function PromptBar() {
         <div className="flex flex-col gap-2">
           <Button
             onClick={handleGenerate}
-            disabled={isGenerating || !prompt.trim()}
+            disabled={isGenerating || isMeshGenerating || !prompt.trim()}
             className="h-auto"
           >
             {isGenerating ? (
@@ -163,7 +113,7 @@ export function PromptBar() {
 
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>⌘/Ctrl + Enter to generate</span>
-        {!geminiConnected && <span className="text-destructive">Gemini not connected</span>}
+        {!backends[backend === "local-stable-diffusion" ? "automatic1111" : backend] && <span>Image backend needs setup; import still works</span>}
       </div>
     </div>
   );

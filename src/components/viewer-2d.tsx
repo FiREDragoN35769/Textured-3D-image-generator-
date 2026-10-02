@@ -8,7 +8,7 @@ export function Viewer2D() {
   const lastElapsedMs = useStore((s) => s.lastElapsedMs);
   const zoom = useStore((s) => s.zoom);
 
-  if (isGenerating) {
+  if (isGenerating && !image) {
     return (
       <div className="flex h-full items-center justify-center">
         <div className="text-center space-y-3">
@@ -19,7 +19,7 @@ export function Viewer2D() {
     );
   }
 
-  if (generateError) {
+  if (generateError && !image) {
     return (
       <div className="flex h-full items-center justify-center p-6">
         <div className="text-center space-y-2 max-w-md">

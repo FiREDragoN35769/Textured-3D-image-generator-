@@ -1,39 +1,30 @@
-// Simple service worker for PWA installability
-const CACHE_NAME = "studio-v1";
+const CACHE_NAME = "studio-v2";
 const PRECACHE = ["/", "/manifest.json"];
-
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)).catch(() => {})
-  );
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE)).catch(() => {}));
   self.skipWaiting();
 });
-
 self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    )
-  );
-  self.clients.claim();
+  event.waitUntil(caches.keys().then((keys) => Promise.all(
+    keys.filter((key) => key.startsWith("studio-") && key !== CACHE_NAME).map((key) => caches.delete(key))
+  )).then(() => self.clients.claim()));
 });
-
 self.addEventListener("fetch", (event) => {
-  // Network-first for API calls, cache-first for static assets
-  const url = new URL(event.request.url);
-  if (url.pathname.startsWith("/api/")) {
-    event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
-  } else {
-    event.respondWith(
-      caches.match(event.request).then((cached) =>
-        cached || fetch(event.request).then((response) => {
-          if (response.ok && response.type === "basic") {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        }).catch(() => cached)
-      )
-    );
+  const request = event.request;
+  const url = new URL(request.url);
+  if (request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
+  if (request.mode === "navigate") {
+    event.respondWith(fetch(request).then((response) => {
+      if (response.ok) event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.put("/", response.clone())));
+      return response;
+    }).catch(async () => (await caches.match("/")) || Response.error()));
+    return;
   }
+  event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
+    if (response.ok && response.type === "basic") {
+      const copy = response.clone();
+      event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.put(request, copy)));
+    }
+    return response;
+  })));
 });

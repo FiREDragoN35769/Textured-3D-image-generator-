@@ -5,6 +5,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { History, RotateCcw, Trash2 } from "lucide-react";
 import type { HistoryEntry } from "@/types";
+import { requestJSON } from "@/lib/api";
+import { toast } from "sonner";
 
 export function HistoryPanel() {
   const historyOpen = useStore((s) => s.historyOpen);
@@ -19,10 +21,9 @@ export function HistoryPanel() {
 
   useEffect(() => {
     if (historyOpen && projectId) {
-      fetch(`/api/projects/${projectId}/history`)
-        .then((r) => r.json())
+      requestJSON<HistoryEntry[]>(`/api/projects/${projectId}/history`)
         .then((entries: HistoryEntry[]) => setHistoryEntries(entries))
-        .catch(() => {});
+        .catch((error) => toast.error(error.message));
     }
   }, [historyOpen, projectId, setHistoryEntries]);
 
@@ -36,8 +37,10 @@ export function HistoryPanel() {
   };
 
   const handleDelete = async (entryId: string) => {
-    // Optimistic remove
-    setHistoryEntries(historyEntries.filter((e) => e.id !== entryId));
+    try {
+      await requestJSON(`/api/projects/${projectId}/history/${entryId}`, { method: "DELETE" });
+      setHistoryEntries(historyEntries.filter((e) => e.id !== entryId));
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Could not delete history"); }
   };
 
   return (

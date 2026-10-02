@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
 # APP_PORT is injected by the sandbox (3000-3099 range)
 # Vite dev server listens on APP_PORT so the sandbox proxy can reach it
@@ -19,6 +20,7 @@ if ($uvHash -and -not (Test-Path $uvHashFile)) {
     Write-Host "[+$(elapsed)ms] uv sync starting..."
     uv sync --compile-bytecode --frozen
     if ($LASTEXITCODE -ne 0) { uv sync --compile-bytecode }
+    if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
     Remove-Item .venv/.uv-hash-* -ErrorAction SilentlyContinue
     New-Item -ItemType File -Path $uvHashFile -Force | Out-Null
     Write-Host "[+$(elapsed)ms] uv sync done"
@@ -31,7 +33,9 @@ $bunHash = (Get-FileHash -Algorithm MD5 bun.lock -ErrorAction SilentlyContinue).
 $bunHashFile = "node_modules/.bun-hash-$bunHash"
 if ($bunHash -and -not (Test-Path $bunHashFile)) {
     Write-Host "[+$(elapsed)ms] bun install starting..."
-    bun install --frozen-lockfile
+    if (Get-Command bun -ErrorAction SilentlyContinue) { bun install --frozen-lockfile }
+    else { npm install --no-audit --no-fund --package-lock=false }
+    if ($LASTEXITCODE -ne 0) { throw "JavaScript dependency installation failed." }
     Remove-Item node_modules/.bun-hash-* -ErrorAction SilentlyContinue
     New-Item -ItemType File -Path $bunHashFile -Force | Out-Null
     Write-Host "[+$(elapsed)ms] bun install done"
@@ -51,7 +55,8 @@ $backendJob = Start-Job -ScriptBlock {
 # Start Vite dev server (foreground)
 Write-Host "[+$(elapsed)ms] Starting Vite on port $VitePort"
 try {
-    bunx vite --host 0.0.0.0 --port $VitePort --strictPort
+    if (Get-Command bun -ErrorAction SilentlyContinue) { bunx vite --host 0.0.0.0 --port $VitePort --strictPort }
+    else { npm run dev -- --host 0.0.0.0 --port $VitePort --strictPort }
 } finally {
     # Cleanup backend when Vite exits
     Stop-Job $backendJob -ErrorAction SilentlyContinue

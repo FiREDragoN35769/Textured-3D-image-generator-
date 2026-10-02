@@ -1,8 +1,10 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { useStore } from "@/lib/store";
 import { Toolbar } from "@/components/toolbar";
 import { Viewer2D } from "@/components/viewer-2d";
-import { Viewer3D } from "@/components/viewer-3d";
+import { requestJSON } from "@/lib/api";
+import { recoverLastMesh } from "@/lib/actions";
+const Viewer3D = lazy(() => import("@/components/viewer-3d").then((module) => ({ default: module.Viewer3D })));
 import { PromptBar } from "@/components/prompt-bar";
 import { AssistantPanel } from "@/components/assistant-panel";
 import { SettingsDialog } from "@/components/settings-dialog";
@@ -10,7 +12,7 @@ import { HistoryPanel } from "@/components/history-panel";
 import { ProjectsPanel } from "@/components/projects-panel";
 import { Toaster } from "sonner";
 import { cn } from "@/lib/utils";
-import type { HealthResponse } from "./types";
+import type { AppSettings, HealthResponse } from "./types";
 
 function App() {
   const viewMode = useStore((s) => s.viewMode);
@@ -19,33 +21,23 @@ function App() {
   const setSettings = useStore((s) => s.setSettings);
   const setMeshParams = useStore((s) => s.setMeshParams);
 
-  // Check API health on mount
   useEffect(() => {
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then((data: HealthResponse) => {
-        setApiStatus(data.ok, data.db ?? false, data.gemini ?? false);
+    let active = true;
+    Promise.all([requestJSON<HealthResponse>("/api/health"), requestJSON<AppSettings>("/api/settings")])
+      .then(([health, settings]) => {
+        if (!active) return;
+        setApiStatus(health.ok, !!health.db, !!health.gemini, health.image_backends, health.mesh?.ready);
+        setSettings(settings);
+        setMeshParams({ mesh_quality: settings.mesh_quality, mesh_device: settings.mesh_device,
+                        bake_texture: settings.bake_texture, texture_resolution: settings.texture_resolution });
+        return recoverLastMesh();
       })
-      .catch(() => setApiStatus(false, false, false));
-  }, [setApiStatus]);
-
-  // Load saved settings
-  useEffect(() => {
-    fetch("/api/settings")
-      .then((r) => r.json())
-      .then((data) => {
-        setSettings(data);
-        setMeshParams({
-          subdivisions: data.subdivisions,
-          height_scale: data.height_scale,
-          smooth: data.smooth,
-        });
-      })
-      .catch(() => {});
-  }, [setSettings, setMeshParams]);
+      .catch(() => { if (active) setApiStatus(false, false, false); });
+    return () => { active = false; };
+  }, [setApiStatus, setSettings, setMeshParams]);
 
   return (
-    <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground">
       {/* Toolbar */}
       <Toolbar />
 
@@ -58,7 +50,7 @@ function App() {
               <Viewer2D />
             </div>
             <div className={cn("absolute inset-0", viewMode === "3d" ? "block" : "hidden")}>
-              <Viewer3D />
+              {viewMode === "3d" && <Suspense fallback={<div className="p-6 text-muted-foreground">Loading 3D viewer…</div>}><Viewer3D /></Suspense>}
             </div>
 
             {/* View mode indicator */}
@@ -82,7 +74,7 @@ function App() {
 
         {/* Assistant panel (right side) */}
         {assistantOpen && (
-          <div className="w-full sm:w-80 shrink-0">
+          <div className="absolute inset-0 z-20 sm:relative sm:inset-auto sm:w-80 shrink-0">
             <AssistantPanel />
           </div>
         )}

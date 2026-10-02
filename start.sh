@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # APP_PORT is injected by the sandbox (3000-3099 range)
 # Vite dev server listens on APP_PORT so the sandbox proxy can reach it
@@ -42,7 +43,11 @@ UV_PID=$!
   BUN_HASH=$(md5sum bun.lock 2>/dev/null | cut -d' ' -f1)
   if [ ! -f "node_modules/.bun-hash-$BUN_HASH" ]; then
     echo "[+$(elapsed)ms] bun install starting..."
-    bun install --frozen-lockfile
+    if command -v bun >/dev/null 2>&1; then
+      bun install --frozen-lockfile
+    else
+      npm install --no-audit --no-fund --package-lock=false
+    fi
     rm -f node_modules/.bun-hash-* 2>/dev/null
     touch "node_modules/.bun-hash-$BUN_HASH"
     echo "[+$(elapsed)ms] bun install done"
@@ -62,7 +67,11 @@ BACKEND_PID=$!
 # Start Vite as soon as JS deps are ready (foreground)
 wait $BUN_PID
 echo "[+$(elapsed)ms] Starting Vite on port $VITE_PORT"
-bunx vite --host 0.0.0.0 --port $VITE_PORT --strictPort
+if command -v bun >/dev/null 2>&1; then
+  bunx vite --host 0.0.0.0 --port "$VITE_PORT" --strictPort
+else
+  npm run dev -- --host 0.0.0.0 --port "$VITE_PORT" --strictPort
+fi
 
 # Cleanup backend when Vite exits
 kill $BACKEND_PID 2>/dev/null

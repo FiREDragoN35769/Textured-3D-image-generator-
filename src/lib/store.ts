@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   HistoryEntry,
   MeshParams,
+  MeshResponse,
   ProjectRecord,
   ViewMode,
 } from "@/types";
@@ -18,6 +19,8 @@ interface HistoryStackEntry {
   negativePrompt: string;
   meshParams: MeshParams;
   viewMode: ViewMode;
+  glbId: string | null;
+  meshInfo: MeshResponse | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -29,6 +32,8 @@ interface AppState {
   apiConnected: boolean;
   dbConnected: boolean;
   geminiConnected: boolean;
+  imageBackends: Record<string, boolean>;
+  meshReady: boolean;
 
   // Current project
   projectId: string | null;
@@ -48,7 +53,9 @@ interface AppState {
   glbId: string | null;
   isMeshGenerating: boolean;
   meshError: string | null;
-  meshInfo: { vertices: number; faces: number; elapsed_ms: number } | null;
+  meshInfo: MeshResponse | null;
+  meshStage: string;
+  meshProgress: number;
 
   // View
   viewMode: ViewMode;
@@ -76,7 +83,7 @@ interface AppState {
   projects: ProjectRecord[];
 
   // Actions
-  setApiStatus: (connected: boolean, db: boolean, gemini: boolean) => void;
+  setApiStatus: (connected: boolean, db: boolean, gemini: boolean, backends?: Record<string, boolean>, meshReady?: boolean) => void;
   setProjectId: (id: string | null) => void;
   setProjectName: (name: string) => void;
   setPrompt: (prompt: string) => void;
@@ -90,7 +97,8 @@ interface AppState {
   setGlbId: (id: string | null) => void;
   setMeshGenerating: (v: boolean) => void;
   setMeshError: (e: string | null) => void;
-  setMeshInfo: (info: { vertices: number; faces: number; elapsed_ms: number } | null) => void;
+  setMeshInfo: (info: MeshResponse | null) => void;
+  setMeshProgress: (stage: string, progress: number) => void;
   setViewMode: (m: ViewMode) => void;
   setZoom: (z: number) => void;
   setSettings: (s: Partial<AppSettings>) => void;
@@ -116,12 +124,14 @@ interface AppState {
 }
 
 const defaultMeshParams: MeshParams = {
-  subdivisions: 128,
-  height_scale: 0.3,
-  smooth: true,
+  mesh_quality: "balanced",
+  mesh_device: "auto",
+  bake_texture: false,
+  texture_resolution: 1024,
 };
 
 const defaultSettings: AppSettings = {
+  ...defaultMeshParams,
   backend: "gemini",
   model: "gemini-3.1-flash-image",
   subdivisions: 128,
@@ -136,6 +146,8 @@ export const useStore = create<AppState>((set, get) => ({
   apiConnected: false,
   dbConnected: false,
   geminiConnected: false,
+  imageBackends: {},
+  meshReady: false,
 
   // Project
   projectId: null,
@@ -156,6 +168,8 @@ export const useStore = create<AppState>((set, get) => ({
   isMeshGenerating: false,
   meshError: null,
   meshInfo: null,
+  meshStage: "",
+  meshProgress: 0,
 
   // View
   viewMode: "2d",
@@ -183,13 +197,13 @@ export const useStore = create<AppState>((set, get) => ({
   projects: [],
 
   // Actions
-  setApiStatus: (connected, db, gemini) =>
-    set({ apiConnected: connected, dbConnected: db, geminiConnected: gemini }),
+  setApiStatus: (connected, db, gemini, imageBackends = {}, meshReady = false) =>
+    set({ apiConnected: connected, dbConnected: db, geminiConnected: gemini, imageBackends, meshReady }),
   setProjectId: (id) => set({ projectId: id }),
   setProjectName: (name) => set({ projectName: name }),
   setPrompt: (prompt) => set({ prompt }),
   setNegativePrompt: (negativePrompt) => set({ negativePrompt }),
-  setImage: (image) => set({ image }),
+  setImage: (image) => set((state) => image === state.image ? { image } : { image, glbId: null, meshInfo: null, meshError: null }),
   setGenerating: (isGenerating) => set({ isGenerating }),
   setGenerateProgress: (generateProgress) => set({ generateProgress }),
   setGenerateError: (generateError) => set({ generateError }),
@@ -199,6 +213,7 @@ export const useStore = create<AppState>((set, get) => ({
   setMeshGenerating: (isMeshGenerating) => set({ isMeshGenerating }),
   setMeshError: (meshError) => set({ meshError }),
   setMeshInfo: (meshInfo) => set({ meshInfo }),
+  setMeshProgress: (meshStage, meshProgress) => set({ meshStage, meshProgress }),
   setViewMode: (viewMode) => set({ viewMode }),
   setZoom: (zoom) => set({ zoom }),
   setSettings: (s) => set((state) => ({ settings: { ...state.settings, ...s } })),
@@ -221,6 +236,8 @@ export const useStore = create<AppState>((set, get) => ({
       negativePrompt: s.negativePrompt,
       meshParams: { ...s.meshParams },
       viewMode: s.viewMode,
+      glbId: s.glbId,
+      meshInfo: s.meshInfo,
     };
     set({ undoStack: [...s.undoStack, entry], redoStack: [] });
   },
@@ -234,6 +251,8 @@ export const useStore = create<AppState>((set, get) => ({
       negativePrompt: s.negativePrompt,
       meshParams: { ...s.meshParams },
       viewMode: s.viewMode,
+      glbId: s.glbId,
+      meshInfo: s.meshInfo,
     };
     const prev = s.undoStack[s.undoStack.length - 1];
     set({
@@ -242,6 +261,9 @@ export const useStore = create<AppState>((set, get) => ({
       negativePrompt: prev.negativePrompt,
       meshParams: prev.meshParams,
       viewMode: prev.viewMode,
+      glbId: prev.glbId,
+      meshInfo: prev.meshInfo,
+      meshError: null,
       undoStack: s.undoStack.slice(0, -1),
       redoStack: [...s.redoStack, current],
     });
@@ -256,6 +278,8 @@ export const useStore = create<AppState>((set, get) => ({
       negativePrompt: s.negativePrompt,
       meshParams: { ...s.meshParams },
       viewMode: s.viewMode,
+      glbId: s.glbId,
+      meshInfo: s.meshInfo,
     };
     const next = s.redoStack[s.redoStack.length - 1];
     set({
@@ -264,6 +288,9 @@ export const useStore = create<AppState>((set, get) => ({
       negativePrompt: next.negativePrompt,
       meshParams: next.meshParams,
       viewMode: next.viewMode,
+      glbId: next.glbId,
+      meshInfo: next.meshInfo,
+      meshError: null,
       undoStack: [...s.undoStack, current],
       redoStack: s.redoStack.slice(0, -1),
     });
@@ -274,7 +301,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   newProject: () => {
     const s = get();
-    s.pushUndo();
+    if (s.isGenerating || s.isMeshGenerating) return;
+    localStorage.removeItem("studio-last-mesh-job");
     set({
       projectId: null,
       projectName: "Untitled",
